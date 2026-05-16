@@ -13,7 +13,6 @@ from typing import Callable, Awaitable
 import numpy as np
 
 import discord
-from discord.sinks import Sink
 
 from .config import RecognitionConfig
 from .types import UserAudioSegment
@@ -117,7 +116,7 @@ class _UserBuffer:
 # Audio sink
 # ---------------------------------------------------------------------------
 
-class DiscordAudioSink(Sink):
+class DiscordAudioSink(discord.Sink):
     """Receives decoded PCM from Discord voice and emits speech segments.
 
     Parameters:
