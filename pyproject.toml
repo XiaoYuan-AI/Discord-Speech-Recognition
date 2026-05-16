@@ -1,0 +1,28 @@
+[project]
+name = "discord-speech-recognition"
+version = "0.1.0"
+description = "Real-time speech recognition for Discord voice channels — zero temp files, supports local AI models"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "discord.py[voice]>=2.4",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+# Local AI model (faster-whisper)
+local = [
+    "faster-whisper>=1.1",
+]
+# Google Speech Recognition (cloud, free tier)
+google = [
+    "SpeechRecognition>=3.14",
+]
+# OpenAI Whisper API
+openai = [
+    "openai>=1.0",
+]
+# Install everything
+all = [
+    "discord-speech-recognition[local,google,openai]",
+]
