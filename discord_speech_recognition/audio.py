@@ -116,8 +116,12 @@ class _UserBuffer:
 # Audio sink
 # ---------------------------------------------------------------------------
 
-class DiscordAudioSink(discord.Sink):
+class DiscordAudioSink:
     """Receives decoded PCM from Discord voice and emits speech segments.
+
+    Implements the duck-type protocol expected by ``VoiceClient.listen()``:
+    ``write(VoiceData)`` and ``cleanup()``.  No base-class dependency on
+    any discord.py internal module.
 
     Parameters:
         config: SDK recognition config (VAD thresholds, sample rate).
@@ -132,16 +136,19 @@ class DiscordAudioSink(discord.Sink):
         *,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        # filters={} disables built-in filtering — we receive raw per-user audio.
-        super().__init__(filters={})  # type: ignore[arg-type]
         self._config = config
         self._on_segment = on_segment
         self._loop = loop
         self._buffers: dict[str, _UserBuffer] = {}
 
-    # -- Sink ABC -----------------------------------------------------------
+    @property
+    def is_listening(self) -> bool:
+        """Discord.py checks this to decide whether to keep feeding audio."""
+        return True
 
-    def write(self, data: discord.VoiceData) -> None:  # type: ignore[override]
+    # -- audio frame handler ------------------------------------------------
+
+    def write(self, data: discord.VoiceData) -> None:
         """Called by discord.py for every 20ms audio frame."""
         if data.user is None:
             return
