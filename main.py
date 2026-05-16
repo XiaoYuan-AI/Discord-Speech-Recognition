@@ -19,7 +19,7 @@ Setup:
 Usage:
     python main.py
 
-Environment variables:
+Environment variables (or place them in a .env file):
     DISCORD_TOKEN   — Discord bot token
     VOICE_CHANNEL   — Discord voice channel ID (snowflake integer)
     OPENAI_API_KEY  — API key for OpenAI Whisper (only if using whisper_api)
@@ -27,6 +27,23 @@ Environment variables:
 
 import asyncio
 import os
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Load .env file if present (no extra dependency required)
+# ---------------------------------------------------------------------------
+_dotenv_path = Path(__file__).parent / ".env"
+if _dotenv_path.exists():
+    with open(_dotenv_path, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _, _val = _line.partition("=")
+            _key = _key.strip()
+            _val = _val.strip().strip('"').strip("'")
+            if _key and _key not in os.environ:
+                os.environ[_key] = _val
 
 from discord_speech_recognition import (
     SpeechRecognitionClient,
