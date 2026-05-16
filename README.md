@@ -220,30 +220,40 @@ All configuration options:
 
 ## Architecture
 
+The receiver is built directly on the official ``discord.py`` library without
+any Sink SDK.  It uses ``VoiceConnectionState.add_socket_listener`` to receive
+raw UDP packets, then handles RTP parsing, decryption (4 encryption modes),
+Opus decoding, and VAD speech segmentation from scratch.
+
 ```
 Discord Voice Channel
     |
     v
-VoiceRecognitionBot          <- discord.py client with voice support
+Raw UDP packets              <- SocketReader thread in discord.py
     |
     v
-DiscordAudioSink.write()     <- 20ms Opus frames, decoded to stereo 48kHz PCM
+VoiceReceiver._on_raw_packet()  <- RTP parse, decrypt (NaCl), Opus decode
     |
     v
-Mono 16kHz conversion        <- numpy-based, in memory
+Mono 16kHz conversion        <- numpy-based, stereo→mono, 48k→16k Hz
     |
     v
-RMS VAD per user             <- energy-based voice activity detection
+RMS VAD per SSRC             <- energy-based voice activity detection
     |
     v
 Speech segment               <- accumulated PCM when silence > threshold
-    |
+    |                            (cross-thread dispatch via run_coroutine_threadsafe)
     v
 BaseRecognizer.recognize()   <- thread pool / async
     |
     v
 RecognitionResult            <- fired to user callback
 ```
+
+SSRC-to-user mapping is resolved via the voice websocket's SPEAKING events
+(opcode 5), which are intercepted by a lightweight monkey-patch on the
+voice websocket's message handler.  This is the only way to get per-user
+attribution with official ``discord.py`` (the fork ``py-cord`` is NOT used).
 
 ## License
 
