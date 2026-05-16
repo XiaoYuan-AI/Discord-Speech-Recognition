@@ -17,7 +17,7 @@ from .types import UserAudioSegment
 
 
 class VoiceRecognitionBot(discord.Client):
-    """A minimal Discord client that joins a voice channel and listens.
+    """A minimal Discord client that joins a voice channel and records.
 
     This is an internal class — users interact with
     :class:`~sdk.SpeechRecognitionClient` instead.
@@ -36,7 +36,6 @@ class VoiceRecognitionBot(discord.Client):
         token: str,
         channel_id: int,
     ) -> None:
-        # Voice-only bot — no privileged intents required.
         intents = discord.Intents.default()
         intents.voice_states = True
         super().__init__(intents=intents)
@@ -54,7 +53,7 @@ class VoiceRecognitionBot(discord.Client):
         """Called when the bot has successfully logged in."""
         channel = self.get_channel(self._channel_id)
         if channel is None:
-            self._connected.set()  # unblock caller — they will see the error
+            self._connected.set()
             return
 
         if not isinstance(channel, discord.VoiceChannel):
@@ -67,14 +66,14 @@ class VoiceRecognitionBot(discord.Client):
             self._connected.set()
             raise
 
-        # Start the audio sink (pass loop for thread-safe callback dispatch).
+        # Start the audio sink and recording.
         loop = asyncio.get_running_loop()
         self._sink = DiscordAudioSink(self._config, self._on_segment, loop=loop)
-        self._voice_client.listen(self._sink)
+        self._voice_client.start_recording(self._sink, _noop_callback)
         self._connected.set()
 
     async def connect_and_listen(self) -> None:
-        """Start the bot's event loop and join the voice channel.
+        """Start the bot's asyncio task and join the voice channel.
 
         Blocks until the voice connection is established (or fails).
         """
@@ -82,8 +81,13 @@ class VoiceRecognitionBot(discord.Client):
         await self._connected.wait()
 
     async def shutdown(self) -> None:
-        """Gracefully disconnect from voice and close the bot."""
+        """Gracefully stop recording, disconnect from voice, and close."""
         if self._voice_client is not None and self._voice_client.is_connected():
-            self._voice_client.stop_listening()
+            self._voice_client.stop_recording()
             await self._voice_client.disconnect()
         await self.close()
+
+
+def _noop_callback(*_args) -> None:
+    """No-op after-recording callback (py-cord requires one)."""
+    pass

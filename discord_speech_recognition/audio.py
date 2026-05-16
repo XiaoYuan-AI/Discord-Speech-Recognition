@@ -13,6 +13,7 @@ from typing import Callable, Awaitable
 import numpy as np
 
 import discord
+from discord.sinks import Sink
 
 from .config import RecognitionConfig
 from .types import UserAudioSegment
@@ -116,17 +117,18 @@ class _UserBuffer:
 # Audio sink
 # ---------------------------------------------------------------------------
 
-class DiscordAudioSink:
+class DiscordAudioSink(Sink):
     """Receives decoded PCM from Discord voice and emits speech segments.
 
-    Implements the duck-type protocol expected by ``VoiceClient.listen()``:
-    ``write(VoiceData)`` and ``cleanup()``.  No base-class dependency on
-    any discord.py internal module.
+    Subclasses py-cord's :class:`discord.sinks.Sink`.  Audio frames are
+    buffered per-user with RMS-based VAD; completed speech segments are
+    dispatched to *on_segment* via the event loop.
 
     Parameters:
         config: SDK recognition config (VAD thresholds, sample rate).
         on_segment: Async callback invoked when a user finishes speaking.
             Signature: ``async def(user_audio: UserAudioSegment) -> None``.
+        loop: The asyncio event loop (for thread-safe callback dispatch).
     """
 
     def __init__(
@@ -136,25 +138,26 @@ class DiscordAudioSink:
         *,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
+        super().__init__(filters={})
         self._config = config
         self._on_segment = on_segment
         self._loop = loop
         self._buffers: dict[str, _UserBuffer] = {}
 
-    @property
-    def is_listening(self) -> bool:
-        """Discord.py checks this to decide whether to keep feeding audio."""
-        return True
+    # -- Sink interface -----------------------------------------------------
 
-    # -- audio frame handler ------------------------------------------------
+    def write(self, data: bytes, user: discord.Member | discord.User) -> None:
+        """Called by py-cord for every 20 ms decoded audio frame.
 
-    def write(self, data: discord.VoiceData) -> None:
-        """Called by discord.py for every 20ms audio frame."""
-        if data.user is None:
+        Parameters:
+            data: Stereo 48 kHz int16 PCM bytes.
+            user: The Discord member/user who produced this audio.
+        """
+        if user is None:
             return
 
-        user_id = str(data.user.id)
-        user_name = getattr(data.user, "display_name", data.user.name)
+        user_id = str(user.id)
+        user_name = getattr(user, "display_name", user.name)
 
         buf = self._buffers.get(user_id)
         if buf is None:
@@ -163,8 +166,8 @@ class DiscordAudioSink:
         else:
             buf.user_name = user_name  # keep display name current
 
-        # Discord sends stereo 48kHz int16 PCM → convert to mono 16kHz.
-        mono_16k = _discord_pcm_to_mono_16k(data.data)
+        # Discord sends stereo 48 kHz int16 PCM → convert to mono 16 kHz.
+        mono_16k = _discord_pcm_to_mono_16k(data)
 
         # VAD: compute normalised RMS energy.
         rms = _rms(mono_16k)
@@ -197,7 +200,7 @@ class DiscordAudioSink:
             )
 
     def cleanup(self) -> None:
-        """Called when the voice client stops listening."""
+        """Called by py-cord when recording stops."""
         self._buffers.clear()
 
 
@@ -206,17 +209,30 @@ class DiscordAudioSink:
 # ---------------------------------------------------------------------------
 
 def _discord_pcm_to_mono_16k(data: bytes) -> np.ndarray:
-    """Convert Discord stereo 48kHz int16 PCM to mono 16kHz int16.
+    """Convert Discord PCM (48 kHz, 16-bit, stereo or mono) to mono 16 kHz.
 
-    Discord delivers 20 ms frames: 960 samples/channel at 48 kHz, stereo.
-    After conversion: 320 samples at 16 kHz, mono.
+    Discord delivers 20 ms frames:
+    - Stereo:  1920 samples (960 per channel) → 3840 bytes
+    - Mono:     960 samples                → 1920 bytes
+
+    We detect stereo by checking if the sample count is large enough
+    to be a stereo frame and is even (required for 2-channel interleaved).
     """
     if not data:
         return np.array([], dtype=np.int16)
 
-    stereo = np.frombuffer(data, dtype=np.int16).reshape(-1, 2)
-    # Take left channel — both channels carry identical data for mono sources.
-    mono = stereo[:, 0].copy()
+    samples = np.frombuffer(data, dtype=np.int16)
+    n = len(samples)
+
+    # Heuristic: a stereo 48kHz frame has ~1920 samples (3840 bytes).
+    # A mono frame has ~960 samples.  If the count suggests stereo,
+    # take the left channel; otherwise treat as mono.
+    if n >= 1500 and n % 2 == 0:
+        # Assume interleaved stereo → extract left channel
+        mono = samples[::2].copy()
+    else:
+        mono = samples.copy()
+
     # Decimate 3× (48 → 16 kHz).  Discards content above 8 kHz (safe for voice).
     return mono[::3]
 
