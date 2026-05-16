@@ -1,0 +1,35 @@
+name: Build & publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*" # triggers on v0.1.0, v1.2.3, etc.
+  workflow_dispatch: # allow manual triggering
+
+jobs:
+  build-and-publish:
+    name: Build wheels and publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # required for OIDC trusted publishing
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
