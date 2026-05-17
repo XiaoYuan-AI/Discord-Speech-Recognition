@@ -134,7 +134,7 @@ class SpeechRecognitionClient:
     # -- internal -----------------------------------------------------------
 
     async def _on_audio_segment(self, segment: UserAudioSegment) -> None:
-        """Callback from the audio sink — transcribe and fire user callback."""
+        """Callback from the receiver — transcribe and fire user callback."""
         if self._recognizer is None or self._on_recognition is None:
             return
 
@@ -143,15 +143,40 @@ class SpeechRecognitionClient:
         # Skip segments that are too short to contain useful speech.
         duration_ms = len(audio) / segment.sample_rate * 1000
         if duration_ms < self._config.min_speech_duration_ms:
+            logger.debug(
+                "Skipping short segment from %s: %.0f ms < %d ms",
+                segment.user_name,
+                duration_ms,
+                self._config.min_speech_duration_ms,
+            )
             return
 
-        result = await self._recognizer.recognize(
-            audio=audio,
-            sample_rate=segment.sample_rate,
-            user_id=segment.user_id,
-            user_name=segment.user_name,
-            language=self._config.language,
+        logger.info(
+            "Transcribing segment: user=%s duration=%.0fms samples=%d",
+            segment.user_name,
+            duration_ms,
+            len(audio),
         )
 
+        try:
+            result = await self._recognizer.recognize(
+                audio=audio,
+                sample_rate=segment.sample_rate,
+                user_id=segment.user_id,
+                user_name=segment.user_name,
+                language=self._config.language,
+            )
+        except Exception:
+            logger.exception("Recognition failed for segment from %s", segment.user_name)
+            return
+
         if not result.is_empty:
+            logger.info(
+                "Recognized: %s → \"%s\" (confidence=%.2f)",
+                segment.user_name,
+                result.text,
+                result.confidence,
+            )
             await self._on_recognition(result)
+        else:
+            logger.debug("Recognition produced empty result for %s", segment.user_name)

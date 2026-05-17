@@ -26,8 +26,22 @@ Environment variables (or place them in a .env file):
 """
 
 import asyncio
+import logging
 import os
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configure logging — show info from our package so you can see what's
+# happening under the hood.  Set to logging.DEBUG for even more detail.
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logging.getLogger("discord_speech_recognition").setLevel(logging.INFO)
+# Uncomment the next line to see every individual voice packet:
+# logging.getLogger("discord_speech_recognition.receiver").setLevel(logging.DEBUG)
 
 # ---------------------------------------------------------------------------
 # Load .env file if present (no extra dependency required)
