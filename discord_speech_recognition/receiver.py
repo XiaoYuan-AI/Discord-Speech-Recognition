@@ -347,6 +347,8 @@ class VoiceReceiver:
         self._own_packet_count: int = 0
         self._decrypt_ok_count: int = 0
         self._decrypt_fail_count: int = 0
+        self._dave_decrypt_fail_count: int = 0
+        self._dave_missing_user_count: int = 0
         self._decode_fail_count: int = 0
         self._speech_frame_count: int = 0
         self._segment_count: int = 0
@@ -388,11 +390,13 @@ class VoiceReceiver:
         self._ssrc_to_user.clear()
         _log.info(
             "VoiceReceiver detached — packets=%d, segments=%d, "
-            "decrypt_ok=%d, decrypt_fail=%d, decode_fail=%d",
+            "decrypt_ok=%d, decrypt_fail=%d, dave_decrypt_fail=%d, "
+            "decode_fail=%d",
             self._packet_count,
             self._segment_count,
             self._decrypt_ok_count,
             self._decrypt_fail_count,
+            self._dave_decrypt_fail_count,
             self._decode_fail_count,
         )
 
@@ -465,6 +469,10 @@ class VoiceReceiver:
         opus_data = _strip_extension_from_plaintext(mv, plaintext)
 
         if len(opus_data) == 0:
+            return
+
+        opus_data = self._decrypt_dave_if_needed(ssrc, opus_data)
+        if not opus_data:
             return
 
         # Decode Opus → stereo 48 kHz int16 PCM, using a per-SSRC decoder
@@ -543,20 +551,63 @@ class VoiceReceiver:
             _log.info(
                 "VoiceReceiver status: packets=%d(own=%d rtcp=%d) "
                 "decrypt_ok=%d decrypt_fail=%d decode_fail=%d "
-                "speech_frames=%d segments=%d ssrcs=%d "
-                "payload_offset=%d mode=%s",
+                "dave_missing_user=%d dave_decrypt_fail=%d "
+                "speech_frames=%d segments=%d ssrcs=%d payload_offset=%d "
+                "mode=%s",
                 self._packet_count,
                 self._own_packet_count,
                 self._rtcp_packet_count,
                 self._decrypt_ok_count,
                 self._decrypt_fail_count,
                 self._decode_fail_count,
+                self._dave_missing_user_count,
+                self._dave_decrypt_fail_count,
                 self._speech_frame_count,
                 self._segment_count,
                 len(self._buffers),
                 self._payload_offset,
                 self._mode,
             )
+
+    def _decrypt_dave_if_needed(self, ssrc: int, opus_data: bytes) -> bytes | None:
+        """Unwrap Discord's optional DAVE E2EE layer before Opus decoding."""
+        connection = (
+            getattr(self._voice_client, "_connection", None)
+            if self._voice_client is not None
+            else None
+        )
+        dave_session = getattr(connection, "dave_session", None)
+        if dave_session is None or not getattr(dave_session, "ready", False):
+            return opus_data
+
+        user = self._ssrc_to_user.get(ssrc)
+        if user is None:
+            self._dave_missing_user_count += 1
+            _log.debug(
+                "Skipping DAVE frame for unknown SSRC %d until user mapping arrives",
+                ssrc,
+            )
+            return None
+
+        user_id, user_name = user
+        try:
+            import davey  # type: ignore[import-not-found]
+
+            return dave_session.decrypt(
+                int(user_id),
+                davey.MediaType.audio,
+                opus_data,
+            )
+        except Exception:
+            self._dave_decrypt_fail_count += 1
+            _log.debug(
+                "DAVE decrypt failed for %s (%s), SSRC %d",
+                user_name,
+                user_id,
+                ssrc,
+                exc_info=True,
+            )
+            return None
 
 
 # ---------------------------------------------------------------------------

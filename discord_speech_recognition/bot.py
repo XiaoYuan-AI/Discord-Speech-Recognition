@@ -8,8 +8,7 @@ Opus decoding, and VAD speech segmentation from scratch.
 from __future__ import annotations
 
 import asyncio
-import types
-from typing import Callable, Awaitable, Any, Coroutine, Dict
+from typing import Callable, Awaitable, Any
 
 import discord
 
@@ -42,7 +41,9 @@ class VoiceRecognitionBot(discord.Client):
         self._voice_client: discord.VoiceClient | None = None
         self._receiver: VoiceReceiver | None = None
         self._connected = asyncio.Event()
-        self._ws_original_received: Any = None  # saved for cleanup
+        self._ws_original_hook: Any = None
+        self._ws_original_connection_hook: Any = None
+        self._ws_hook_installed = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -53,26 +54,28 @@ class VoiceRecognitionBot(discord.Client):
             self._connected.set()
             return
 
-        if not isinstance(channel, discord.VoiceChannel):
+        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
             self._connected.set()
             return
 
+        loop = asyncio.get_running_loop()
+        self._receiver = VoiceReceiver(self._config, self._on_segment, loop)
+        voice_ws_hook = self._make_voice_ws_hook(self._receiver, channel.guild)
+
+        class _ReceivingVoiceClient(discord.VoiceClient):
+            def create_connection_state(voice_self):
+                state = super().create_connection_state()
+                state.hook = voice_ws_hook
+                return state
+
         try:
-            self._voice_client = await channel.connect()
+            self._voice_client = await channel.connect(cls=_ReceivingVoiceClient)
         except Exception:
             self._connected.set()
             raise
 
         # Attach our custom voice receiver directly to the VoiceClient.
-        loop = asyncio.get_running_loop()
-        self._receiver = VoiceReceiver(self._config, self._on_segment, loop)
         self._receiver.attach(self._voice_client)
-
-        # Hook the voice websocket to capture SPEAKING events (opcode 5).
-        # Discord sends these over the voice websocket to tell us which
-        # SSRC maps to which user — this is the only way to get that
-        # mapping with official discord.py (no Sink SDK).
-        self._hook_voice_ws(channel)
 
         self._connected.set()
 
@@ -95,55 +98,143 @@ class VoiceRecognitionBot(discord.Client):
 
     # -- voice websocket SSRC tracking --------------------------------------
 
-    def _hook_voice_ws(self, channel: discord.VoiceChannel) -> None:
-        """Monkey-patch the voice websocket to capture SSRC→user mappings.
+    def _hook_voice_ws(self, channel: discord.VoiceChannel | discord.StageChannel) -> None:
+        """Register a voice websocket hook to capture SSRC→user mappings.
 
-        The Discord voice gateway sends SPEAKING events (opcode 5) that
-        contain ``{user_id, ssrc, speaking}``.  We intercept these to
-        resolve SSRCs to real Discord user IDs and display names.
+        The Discord voice gateway sends speaking/client events that contain
+        user IDs and SSRCs.  We observe those events through discord.py's
+        hook API so reconnects keep receiving mappings.
         """
         if self._voice_client is None or self._receiver is None:
             return
 
         voice_ws = self._voice_client.ws
-        if not hasattr(voice_ws, "received_message"):
+        if not hasattr(voice_ws, "_hook"):
             return
 
-        # Save the original bound method for later restoration.
-        _original_received = voice_ws.received_message
-        self._ws_original_received = _original_received
-        receiver = self._receiver
-        guild = channel.guild
+        if self._ws_hook_installed:
+            self._unhook_voice_ws()
 
-        async def _patched_received(
-            ws_self: Any, msg: Dict[str, Any]
-        ) -> Coroutine[Any, Any, None]:
-            # discord.py hands us an ALREADY-PARSED dict here (see
-            # DiscordVoiceWebSocket.poll_event → received_message).
-            # Process SPEAKING events to learn SSRC → user mappings.
-            if isinstance(msg, dict) and msg.get("op") == 5:
-                d = msg.get("d") or {}
-                user_id = str(d.get("user_id", ""))
-                ssrc = d.get("ssrc", 0)
-                if user_id and ssrc:
-                    user_name = user_id
-                    if guild is not None:
-                        member = guild.get_member(int(user_id))
-                        if member is not None:
-                            user_name = member.display_name
-                    receiver.register_ssrc(ssrc, user_id, user_name)
+        _original_hook = voice_ws._hook
+        connection = getattr(self._voice_client, "_connection", None)
+        _original_connection_hook = getattr(connection, "hook", None)
+        self._ws_original_hook = _original_hook
+        self._ws_original_connection_hook = _original_connection_hook
+        _voice_ws_hook = self._make_voice_ws_hook(
+            self._receiver,
+            channel.guild,
+            _original_hook,
+        )
 
-            # Always forward to the original handler so discord.py internals
-            # (heartbeat ACKs, session descriptions, etc.) continue to work.
-            return await _original_received(msg)
-
-        voice_ws.received_message = types.MethodType(_patched_received, voice_ws)
+        voice_ws._hook = _voice_ws_hook
+        if connection is not None:
+            # New voice websockets created during a reconnect inherit this hook.
+            connection.hook = _voice_ws_hook
+        self._ws_hook_installed = True
 
     def _unhook_voice_ws(self) -> None:
         """Restore the original voice websocket message handler."""
-        if self._voice_client is None or self._ws_original_received is None:
+        if self._voice_client is None or not getattr(self, "_ws_hook_installed", False):
             return
+        connection = getattr(self._voice_client, "_connection", None)
+        if connection is not None:
+            connection.hook = self._ws_original_connection_hook
         voice_ws = self._voice_client.ws
-        if hasattr(voice_ws, "received_message"):
-            voice_ws.received_message = self._ws_original_received
-        self._ws_original_received = None
+        if hasattr(voice_ws, "_hook"):
+            voice_ws._hook = self._ws_original_hook
+        self._ws_original_hook = None
+        self._ws_original_connection_hook = None
+        self._ws_hook_installed = False
+
+    def _make_voice_ws_hook(
+        self,
+        receiver: VoiceReceiver,
+        guild: discord.Guild | None,
+        original_hook: Any = None,
+    ):
+        async def _voice_ws_hook(ws_self: Any, msg: dict[str, Any]) -> None:
+            # discord.py invokes hooks after its own voice gateway handling.
+            self._handle_voice_ws_message(receiver, guild, msg)
+            if original_hook is not None and original_hook is not _voice_ws_hook:
+                await original_hook(ws_self, msg)
+
+        return _voice_ws_hook
+
+    @staticmethod
+    def _handle_voice_ws_message(
+        receiver: VoiceReceiver,
+        guild: discord.Guild | None,
+        msg: dict[str, Any],
+    ) -> None:
+        if not isinstance(msg, dict):
+            return
+
+        op = msg.get("op")
+        data = msg.get("d") or {}
+
+        if op == 5:  # SPEAKING
+            if not isinstance(data, dict):
+                return
+            VoiceRecognitionBot._register_voice_user(
+                receiver,
+                guild,
+                user_id=data.get("user_id"),
+                ssrc=data.get("ssrc"),
+            )
+            return
+
+        if op == 12:  # CLIENT_CONNECT
+            if not isinstance(data, dict):
+                return
+            VoiceRecognitionBot._register_voice_user(
+                receiver,
+                guild,
+                user_id=data.get("user_id"),
+                ssrc=data.get("audio_ssrc") or data.get("ssrc"),
+            )
+            return
+
+        if op == 11:  # CLIENTS_CONNECT
+            users = data.get("users", []) if isinstance(data, dict) else []
+            for user in users:
+                if not isinstance(user, dict):
+                    continue
+                VoiceRecognitionBot._register_voice_user(
+                    receiver,
+                    guild,
+                    user_id=user.get("user_id"),
+                    ssrc=user.get("audio_ssrc") or user.get("ssrc"),
+                )
+
+    @staticmethod
+    def _register_voice_user(
+        receiver: VoiceReceiver,
+        guild: discord.Guild | None,
+        *,
+        user_id: Any,
+        ssrc: Any,
+    ) -> None:
+        if user_id is None or ssrc is None:
+            return
+
+        user_id_str = str(user_id)
+        if not user_id_str:
+            return
+
+        try:
+            ssrc_int = int(ssrc)
+        except (TypeError, ValueError):
+            return
+        if ssrc_int == 0:
+            return
+
+        user_name = user_id_str
+        if guild is not None:
+            try:
+                member = guild.get_member(int(user_id_str))
+            except (TypeError, ValueError):
+                member = None
+            if member is not None:
+                user_name = member.display_name
+
+        receiver.register_ssrc(ssrc_int, user_id_str, user_name)

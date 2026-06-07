@@ -146,6 +146,66 @@ def test_receiver_attach_loads_opus_and_registers_socket_listener(monkeypatch):
     assert listeners == [receiver._on_raw_packet]
 
 
+def test_receiver_decrypts_dave_payload_with_registered_user():
+    import davey
+
+    async def on_segment(_segment):
+        pass
+
+    class FakeDaveSession:
+        ready = True
+
+        def __init__(self):
+            self.calls = []
+
+        def decrypt(self, user_id, media_type, packet):
+            self.calls.append((user_id, media_type, packet))
+            return b"opus"
+
+    dave_session = FakeDaveSession()
+    receiver = VoiceReceiver(RecognitionConfig(), on_segment, asyncio.new_event_loop())
+    receiver._voice_client = SimpleNamespace(
+        _connection=SimpleNamespace(dave_session=dave_session)
+    )
+    receiver.register_ssrc(123, "42", "Alice")
+
+    assert receiver._decrypt_dave_if_needed(123, b"encrypted") == b"opus"
+    assert dave_session.calls == [(42, davey.MediaType.audio, b"encrypted")]
+
+
+def test_receiver_skips_dave_payload_until_ssrc_user_mapping_arrives():
+    async def on_segment(_segment):
+        pass
+
+    receiver = VoiceReceiver(RecognitionConfig(), on_segment, asyncio.new_event_loop())
+    receiver._voice_client = SimpleNamespace(
+        _connection=SimpleNamespace(dave_session=SimpleNamespace(ready=True))
+    )
+
+    assert receiver._decrypt_dave_if_needed(123, b"encrypted") is None
+    assert receiver._dave_missing_user_count == 1
+
+
+def test_receiver_counts_dave_decrypt_failures():
+    async def on_segment(_segment):
+        pass
+
+    class FakeDaveSession:
+        ready = True
+
+        def decrypt(self, *_args):
+            raise RuntimeError("bad dave frame")
+
+    receiver = VoiceReceiver(RecognitionConfig(), on_segment, asyncio.new_event_loop())
+    receiver._voice_client = SimpleNamespace(
+        _connection=SimpleNamespace(dave_session=FakeDaveSession())
+    )
+    receiver.register_ssrc(123, "42", "Alice")
+
+    assert receiver._decrypt_dave_if_needed(123, b"encrypted") is None
+    assert receiver._dave_decrypt_fail_count == 1
+
+
 def test_rms_matches_public_normalized_contract():
     assert _rms(np.array([0], dtype=np.int16)) == 0.0
     assert 0.49 < _rms(np.array([16384], dtype=np.int16)) < 0.51
