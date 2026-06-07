@@ -50,7 +50,11 @@ class GoogleRecognizer(BaseRecognizer):
         raw_wav: bytes = _numpy_to_wav_bytes(audio, sample_rate)
         audio_data = sr.AudioData(raw_wav, sample_rate, 2)  # 2 = 16-bit
 
-        lang_code = language or self._config.google_language
+        lang_code = (
+            language
+            if language and language != "auto"
+            else self._config.google_language
+        )
 
         loop = asyncio.get_running_loop()
         try:

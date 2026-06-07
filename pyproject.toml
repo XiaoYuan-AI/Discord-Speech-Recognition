@@ -5,8 +5,11 @@ description = "Real-time speech recognition for Discord voice channels — zero 
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "certifi>=2026.4.22",
     "discord-py[voice]>=2.4",
+    "faster-whisper>=1.2.1",
     "numpy>=2.0",
+    "scipy>=1.17.1",
 ]
 
 [project.optional-dependencies]
@@ -26,3 +29,12 @@ openai = [
 all = [
     "discord-speech-recognition[local,google,openai]",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

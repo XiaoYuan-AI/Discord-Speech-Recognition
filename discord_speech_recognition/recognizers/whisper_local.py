@@ -99,14 +99,22 @@ class LocalWhisperRecognizer(BaseRecognizer):
 
 
 def _transcribe_sync(model, audio_f32: np.ndarray, lang: Optional[str]):
-    """Run faster-whisper transcription synchronously (called in thread pool)."""
+    """Run faster-whisper transcription synchronously (called in thread pool).
+
+    The upstream :class:`VoiceReceiver` already RMS-gates speech before it
+    ever reaches us, so we explicitly disable faster-whisper's internal
+    Silero VAD — otherwise short Discord segments are routinely silenced
+    out, which produces a language guess but zero text.
+    """
     segments, info = model.transcribe(
         audio_f32,
         language=lang,
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters={"threshold": 0.5},
+        beam_size=1,
+        condition_on_previous_text=False,
+        vad_filter=False,
+        no_speech_threshold=0.6,
     )
-    texts = [seg.text.strip() for seg in segments]
+    # `segments` is a generator; force it to materialise.
+    texts = [seg.text.strip() for seg in segments if seg.text and seg.text.strip()]
     full_text = " ".join(texts).strip()
     return full_text, info.language, info.language_probability

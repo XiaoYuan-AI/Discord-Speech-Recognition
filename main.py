@@ -28,7 +28,26 @@ Environment variables (or place them in a .env file):
 import asyncio
 import logging
 import os
+import ssl
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# macOS / python.org Python ships without a usable OpenSSL trust store, which
+# makes aiohttp (and therefore discord.py) fail with
+#   SSLCertVerificationError: unable to get local issuer certificate
+# Point OpenSSL at certifi's CA bundle if the system one is empty.
+# ---------------------------------------------------------------------------
+if not os.environ.get("SSL_CERT_FILE"):
+    _paths = ssl.get_default_verify_paths()
+    _cafile = _paths.cafile
+    if not _cafile or not Path(_cafile).exists():
+        try:
+            import certifi  # type: ignore[import-not-found]
+
+            os.environ["SSL_CERT_FILE"] = certifi.where()
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+        except ImportError:
+            pass
 
 # ---------------------------------------------------------------------------
 # Configure logging — show info from our package so you can see what's
@@ -66,10 +85,20 @@ from discord_speech_recognition import (
 )
 
 
+recognition_logger = logging.getLogger("recognition")
+
+
 async def on_recognition(result: RecognitionResult) -> None:
     """Called for every transcribed speech segment."""
-    timestamp = result.timestamp.strftime("%H:%M:%S")
-    print(f"[{timestamp}] {result.user_name}: {result.text}")
+    recognition_logger.info(
+        "%s [%s, %.2f conf, %d ms via %s]: %s",
+        result.user_name,
+        result.language,
+        result.confidence,
+        result.duration_ms,
+        result.recognizer_name,
+        result.text,
+    )
 
 
 async def main() -> None:

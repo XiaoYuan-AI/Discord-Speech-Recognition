@@ -8,8 +8,11 @@ speech segmentation — all without any SDK or fork dependency.
 from __future__ import annotations
 
 import asyncio
+import ctypes.util
 import logging
+import os
 import struct
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Callable, Awaitable
@@ -19,10 +22,70 @@ import numpy as np
 import discord
 from nacl.secret import SecretBox, Aead
 
+from .audio import discord_pcm_to_mono_16k
 from .config import RecognitionConfig
 from .types import UserAudioSegment
 
 _log = logging.getLogger(__name__)
+
+
+def _ensure_opus_loaded() -> None:
+    """Make sure ``libopus`` is loaded so ``discord.opus.Decoder`` works.
+
+    On macOS the dylib isn't on the default loader path even when installed
+    via Homebrew, and on most Linux distros only the SONAME is shipped —
+    so ``discord.py``'s auto-loader frequently misses it.  We try a small
+    set of well-known locations / names and call :func:`discord.opus.load_opus`
+    on the first hit.
+    """
+    if discord.opus.is_loaded():
+        return
+
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        candidates += [
+            # Homebrew (Apple Silicon, then Intel), then MacPorts.
+            "/opt/homebrew/lib/libopus.dylib",
+            "/opt/homebrew/lib/libopus.0.dylib",
+            "/usr/local/lib/libopus.dylib",
+            "/usr/local/lib/libopus.0.dylib",
+            "/opt/local/lib/libopus.dylib",
+            "libopus.0.dylib",
+            "libopus.dylib",
+        ]
+    elif sys.platform.startswith("linux"):
+        candidates += ["libopus.so.0", "libopus.so"]
+    elif sys.platform == "win32":
+        candidates += ["libopus-0.dll", "opus.dll"]
+
+    # Whatever ctypes thinks is the canonical name on this platform.
+    discovered = ctypes.util.find_library("opus")
+    if discovered:
+        candidates.append(discovered)
+
+    last_err: Exception | None = None
+    for name in candidates:
+        if not name:
+            continue
+        if os.sep in name and not os.path.exists(name):
+            continue
+        try:
+            discord.opus.load_opus(name)
+            if discord.opus.is_loaded():
+                _log.info("Loaded libopus from %s", name)
+                return
+        except Exception as e:  # OSError, OpusNotLoaded, …
+            last_err = e
+            continue
+
+    hint = (
+        "brew install opus" if sys.platform == "darwin"
+        else "apt-get install libopus0" if sys.platform.startswith("linux")
+        else "install the Opus codec library"
+    )
+    raise RuntimeError(
+        f"libopus is not installed or could not be loaded. Install it with: {hint}"
+    ) from last_err
 
 
 # ---------------------------------------------------------------------------
@@ -50,33 +113,65 @@ _RTP_CSRC_COUNT_MASK = 0x0F
 # Expected RTP version for Discord voice packets.
 _RTP_VERSION = 2 << 6  # 0x80
 
+# RTCP packets share the same UDP socket and use RTP version 2 too.  We
+# distinguish them by byte-1 payload type: RTCP uses 200..204 (SR, RR,
+# SDES, BYE, APP) — values that can never appear as an RTP payload type
+# because RTP's PT field is only 7 bits (0..127).  Anything ≥ 200 is
+# therefore guaranteed RTCP and should be skipped silently.
+_RTCP_PT_RANGE = range(200, 205)
 
-def _rtp_payload_offset(packet: memoryview) -> int:
-    """Return the byte offset where the RTP payload begins.
 
-    Handles the optional CSRC list and optional header extension.
+def _rtp_unencrypted_prefix_size(packet: memoryview) -> int:
+    """Return the size of the unencrypted RTP prefix for ``*_rtpsize`` modes.
+
+    For Discord's ``aead_*_rtpsize`` encryption modes (the only supported
+    modes since Nov 2024), the unencrypted header — and therefore the AAD —
+    is defined SRTP-style: it includes the 12-byte RTP header, any CSRCs
+    AND the 4-byte extension preamble (profile + length) when the X flag
+    is set, but NOT the extension data itself.  The extension data and the
+    Opus payload are part of the ciphertext.
     """
     if len(packet) < _RTP_HEADER_SIZE:
-        return _RTP_HEADER_SIZE  # will be filtered out by length check
+        return _RTP_HEADER_SIZE
 
     byte0 = packet[0]
-
-    # Validate RTP version (must be 2).
     if (byte0 & _RTP_VERSION_MASK) != _RTP_VERSION:
-        return _RTP_HEADER_SIZE  # not a valid RTP packet
+        return _RTP_HEADER_SIZE
 
     csrc_count = byte0 & _RTP_CSRC_COUNT_MASK
-    offset = _RTP_HEADER_SIZE + csrc_count * 4  # each CSRC is 4 bytes
+    offset = _RTP_HEADER_SIZE + csrc_count * 4
 
-    # Check for header extension.
     if byte0 & _RTP_EXTENSION_MASK:
-        if len(packet) >= offset + _RTP_EXTENSION_HEADER_SIZE:
-            ext_len_words = struct.unpack_from(
-                ">H", packet, offset + 2
-            )[0]
-            offset += _RTP_EXTENSION_HEADER_SIZE + ext_len_words * 4
+        # Include only the 4-byte extension PREAMBLE in the unencrypted
+        # prefix.  Extension data follows after decryption.
+        offset += _RTP_EXTENSION_HEADER_SIZE
 
     return offset
+
+
+def _strip_extension_from_plaintext(
+    packet: memoryview, plaintext: bytes
+) -> bytes:
+    """Strip the (decrypted) RTP extension body from the plaintext.
+
+    In ``*_rtpsize`` modes the extension data sits at the start of the
+    ciphertext.  Its length (in 32-bit words) lives in the unencrypted
+    extension preamble within the RTP header.
+    """
+    byte0 = packet[0]
+    if not (byte0 & _RTP_EXTENSION_MASK):
+        return plaintext
+
+    csrc_count = byte0 & _RTP_CSRC_COUNT_MASK
+    preamble_offset = _RTP_HEADER_SIZE + csrc_count * 4
+    if len(packet) < preamble_offset + _RTP_EXTENSION_HEADER_SIZE:
+        return plaintext
+
+    ext_len_words = struct.unpack_from(">H", packet, preamble_offset + 2)[0]
+    ext_bytes = ext_len_words * 4
+    if ext_bytes >= len(plaintext):
+        return b""
+    return plaintext[ext_bytes:]
 
 
 def _parse_rtp_header(packet: memoryview) -> tuple[int, int, int]:
@@ -239,7 +334,8 @@ class VoiceReceiver:
         self._on_segment = on_segment
         self._loop = loop
         self._voice_client: discord.VoiceClient | None = None
-        self._decoder: discord.opus.Decoder | None = None
+        self._decoders: dict[int, discord.opus.Decoder] = {}
+        self._opus_loaded: bool = False
         self._mode: str = _MODE_NORMAL
         self._secret_key: list[int] = []
         self._buffers: dict[int, _UserBuffer] = {}
@@ -247,6 +343,7 @@ class VoiceReceiver:
 
         # Diagnostic counters (updated from the SocketReader thread).
         self._packet_count: int = 0
+        self._rtcp_packet_count: int = 0
         self._own_packet_count: int = 0
         self._decrypt_ok_count: int = 0
         self._decrypt_fail_count: int = 0
@@ -266,7 +363,8 @@ class VoiceReceiver:
         self._voice_client = voice_client
         self._mode = voice_client.mode
         self._secret_key = voice_client.secret_key
-        self._decoder = discord.opus.Decoder()
+        _ensure_opus_loaded()
+        self._opus_loaded = True
 
         # Register our callback on the internal socket reader thread.
         voice_client._connection.add_socket_listener(self._on_raw_packet)
@@ -285,7 +383,7 @@ class VoiceReceiver:
                 self._on_raw_packet
             )
             self._voice_client = None
-        self._decoder = None
+        self._decoders.clear()
         self._buffers.clear()
         self._ssrc_to_user.clear()
         _log.info(
@@ -321,17 +419,30 @@ class VoiceReceiver:
         if (byte0 & _RTP_VERSION_MASK) != _RTP_VERSION:
             return  # not a voice RTP packet (e.g. an IP-discovery packet)
 
-        # Compute the payload offset, accounting for CSRC and extensions.
-        payload_offset = _rtp_payload_offset(mv)
-        if payload_offset >= len(data):
+        # RTCP packets share this UDP port — drop them before they pollute
+        # the decrypt-fail counter.  Their byte-1 PT (200..204) is outside
+        # the 7-bit RTP PT space, so the test is unambiguous.
+        if mv[1] in _RTCP_PT_RANGE:
+            self._rtcp_packet_count += 1
+            return
+
+        # Compute the unencrypted-prefix size.  For *_rtpsize modes this
+        # is the AAD; the extension body remains inside the ciphertext.
+        prefix_size = _rtp_unencrypted_prefix_size(mv)
+        if prefix_size >= len(data):
             return
         if self._payload_offset == 0:
-            self._payload_offset = payload_offset
+            self._payload_offset = prefix_size
 
-        # The first 12 bytes are always the fixed RTP header (needed for
-        # decryption nonce and SSRC extraction).
-        header = bytes(mv[:_RTP_HEADER_SIZE])
-        encrypted_payload = data[payload_offset:]
+        # For AEAD/rtpsize modes the header passed as AAD is the full
+        # unencrypted prefix.  For the deprecated xsalsa20 modes only the
+        # first 12 bytes are used (they ignore CSRCs/extensions, but those
+        # never appear on those legacy paths from Discord).
+        if self._mode == _MODE_AEAD:
+            header = bytes(mv[:prefix_size])
+        else:
+            header = bytes(mv[:_RTP_HEADER_SIZE])
+        encrypted_payload = data[prefix_size:]
 
         _, _, ssrc = _parse_rtp_header(mv)
 
@@ -341,20 +452,29 @@ class VoiceReceiver:
             return
 
         # Decrypt.
-        opus_data = _decrypt(
+        plaintext = _decrypt(
             self._mode, header, encrypted_payload, self._secret_key
         )
-        if opus_data is None:
+        if plaintext is None:
             self._decrypt_fail_count += 1
             return
         self._decrypt_ok_count += 1
 
+        # In *_rtpsize modes the extension data sits at the start of the
+        # plaintext — strip it to get the raw Opus frame.
+        opus_data = _strip_extension_from_plaintext(mv, plaintext)
+
         if len(opus_data) == 0:
             return
 
-        # Decode Opus → stereo 48 kHz int16 PCM.
+        # Decode Opus → stereo 48 kHz int16 PCM, using a per-SSRC decoder
+        # so each user's PLC / gain state stays isolated.
+        decoder = self._decoders.get(ssrc)
+        if decoder is None:
+            decoder = discord.opus.Decoder()
+            self._decoders[ssrc] = decoder
         try:
-            pcm = self._decoder.decode(opus_data)  # type: ignore[union-attr]
+            pcm = decoder.decode(opus_data)
         except Exception:
             self._decode_fail_count += 1
             return
@@ -421,12 +541,13 @@ class VoiceReceiver:
         # Periodic diagnostic summary.
         if self._packet_count % self._LOG_EVERY_N == 0:
             _log.info(
-                "VoiceReceiver status: packets=%d(own=%d) "
+                "VoiceReceiver status: packets=%d(own=%d rtcp=%d) "
                 "decrypt_ok=%d decrypt_fail=%d decode_fail=%d "
                 "speech_frames=%d segments=%d ssrcs=%d "
                 "payload_offset=%d mode=%s",
                 self._packet_count,
                 self._own_packet_count,
+                self._rtcp_packet_count,
                 self._decrypt_ok_count,
                 self._decrypt_fail_count,
                 self._decode_fail_count,
@@ -443,16 +564,16 @@ class VoiceReceiver:
 # ---------------------------------------------------------------------------
 
 def _discord_pcm_to_mono_16k(data: bytes) -> np.ndarray:
-    """Convert Discord stereo 48 kHz int16 PCM to mono 16 kHz int16."""
-    if not data:
-        return np.array([], dtype=np.int16)
-    samples = np.frombuffer(data, dtype=np.int16)
-    n = len(samples)
-    if n >= 1500 and n % 2 == 0:
-        mono = samples[::2].copy()
-    else:
-        mono = samples.copy()
-    return mono[::3]
+    """Convert Discord stereo 48 kHz int16 PCM to mono 16 kHz int16.
+
+    ``discord.opus.Decoder`` always decodes to two channels (interleaved
+    LRLR…), regardless of what the encoder used — so we average L+R into
+    a mono channel, then properly resample 48 kHz → 16 kHz with a
+    polyphase low-pass filter.  A bare ``[::3]`` decimation aliases all
+    audio between 8–24 kHz back into the speech band, which is enough
+    distortion to make Whisper produce gibberish / hallucinations.
+    """
+    return discord_pcm_to_mono_16k(data)
 
 
 def _rms(frame: np.ndarray) -> float:

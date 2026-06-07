@@ -36,10 +36,10 @@ class WhisperAPIRecognizer(BaseRecognizer):
 
     def _get_client(self):
         if self._client is None:
-            from openai import AsyncOpenAI  # type: ignore[import-untyped]
-
             if not self._config.openai_api_key:
                 raise ValueError("openai_api_key is required for WhisperAPIRecognizer")
+
+            from openai import AsyncOpenAI  # type: ignore[import-untyped]
 
             self._client = AsyncOpenAI(api_key=self._config.openai_api_key)
         return self._client

@@ -6,6 +6,14 @@ The voice receive and VAD segmentation logic now lives in :mod:`receiver`.
 from __future__ import annotations
 
 import numpy as np
+from scipy.signal import firwin, resample_poly
+
+
+# 193-tap Kaiser FIR with cutoff at 7.2 kHz / 24 kHz Nyquist.  Designed
+# once at import time and reused for every Discord PCM frame.
+_RESAMPLE_FIR_48_TO_16 = firwin(
+    numtaps=193, cutoff=7200.0, fs=48000.0, window=("kaiser", 8.6)
+).astype(np.float32)
 
 
 def discord_pcm_to_mono_16k(data: bytes) -> np.ndarray:
@@ -15,7 +23,10 @@ def discord_pcm_to_mono_16k(data: bytes) -> np.ndarray:
     - Stereo:  1920 samples (960 per channel) → 3840 bytes
     - Mono:     960 samples                → 1920 bytes
 
-    Stereo is detected heuristically by sample count.
+    Stereo is detected heuristically by sample count.  Stereo frames are
+    mixed down by averaging both channels, then resampled with a low-pass
+    polyphase filter to avoid folding high-frequency energy into the
+    speech band.
     """
     if not data:
         return np.array([], dtype=np.int16)
@@ -24,13 +35,18 @@ def discord_pcm_to_mono_16k(data: bytes) -> np.ndarray:
     n = len(samples)
 
     if n >= 1500 and n % 2 == 0:
-        # Interleaved stereo → take left channel
-        mono = samples[::2].copy()
+        stereo = samples.reshape(-1, 2).astype(np.int32)
+        mono_48k = ((stereo[:, 0] + stereo[:, 1]) // 2).astype(np.int16)
     else:
-        mono = samples.copy()
+        mono_48k = samples.copy()
 
-    # Decimate 3× (48 → 16 kHz)
-    return mono[::3]
+    resampled = resample_poly(
+        mono_48k.astype(np.float32),
+        up=1,
+        down=3,
+        window=_RESAMPLE_FIR_48_TO_16,
+    )
+    return np.clip(resampled, -32768, 32767).astype(np.int16)
 
 
 def rms(frame: np.ndarray) -> float:

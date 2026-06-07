@@ -8,9 +8,8 @@ Opus decoding, and VAD speech segmentation from scratch.
 from __future__ import annotations
 
 import asyncio
-import json
 import types
-from typing import Callable, Awaitable, Any, Coroutine
+from typing import Callable, Awaitable, Any, Coroutine, Dict
 
 import discord
 
@@ -116,25 +115,23 @@ class VoiceRecognitionBot(discord.Client):
         receiver = self._receiver
         guild = channel.guild
 
-        async def _patched_received(ws_self: Any, msg: str) -> Coroutine[Any, Any, None]:
-            # Process SPEAKING events to learn SSRC→user mappings.
-            try:
-                data = json.loads(msg)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            else:
-                if data.get("op") == 5:  # Voice Gateway SPEAKING event
-                    d = data.get("d", {})
-                    user_id = str(d.get("user_id", ""))
-                    ssrc = d.get("ssrc", 0)
-                    if user_id and ssrc:
-                        # Resolve display name from the guild member cache.
-                        user_name = user_id
-                        if guild is not None:
-                            member = guild.get_member(int(user_id))
-                            if member is not None:
-                                user_name = member.display_name
-                        receiver.register_ssrc(ssrc, user_id, user_name)
+        async def _patched_received(
+            ws_self: Any, msg: Dict[str, Any]
+        ) -> Coroutine[Any, Any, None]:
+            # discord.py hands us an ALREADY-PARSED dict here (see
+            # DiscordVoiceWebSocket.poll_event → received_message).
+            # Process SPEAKING events to learn SSRC → user mappings.
+            if isinstance(msg, dict) and msg.get("op") == 5:
+                d = msg.get("d") or {}
+                user_id = str(d.get("user_id", ""))
+                ssrc = d.get("ssrc", 0)
+                if user_id and ssrc:
+                    user_name = user_id
+                    if guild is not None:
+                        member = guild.get_member(int(user_id))
+                        if member is not None:
+                            user_name = member.display_name
+                    receiver.register_ssrc(ssrc, user_id, user_name)
 
             # Always forward to the original handler so discord.py internals
             # (heartbeat ACKs, session descriptions, etc.) continue to work.
