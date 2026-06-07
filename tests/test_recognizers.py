@@ -17,15 +17,21 @@ from discord_speech_recognition.recognizers.whisper_api import (
     WhisperAPIRecognizer,
     _numpy_to_wav_bytes as whisper_numpy_to_wav_bytes,
 )
-from discord_speech_recognition.recognizers.whisper_local import _transcribe_sync
+from discord_speech_recognition.recognizers.whisper_local import (
+    LocalWhisperRecognizer,
+    _prepare_audio,
+    _transcribe_sync,
+)
 
 
 class FakeWhisperModel:
     def __init__(self):
         self.kwargs = None
+        self.calls = []
 
     def transcribe(self, audio, **kwargs):
         self.kwargs = kwargs
+        self.calls.append(kwargs)
         info = SimpleNamespace(language="en", language_probability=0.87)
         segments = iter(
             [
@@ -43,6 +49,7 @@ def test_transcribe_sync_uses_fast_settings_and_joins_non_empty_segments():
         model,
         np.zeros(16000, dtype=np.float32),
         "en",
+        RecognitionConfig(),
     )
 
     assert text == "hello world"
@@ -50,11 +57,82 @@ def test_transcribe_sync_uses_fast_settings_and_joins_non_empty_segments():
     assert confidence == 0.87
     assert model.kwargs == {
         "language": "en",
-        "beam_size": 1,
+        "beam_size": 3,
+        "best_of": 3,
+        "temperature": 0.0,
         "condition_on_previous_text": False,
         "vad_filter": False,
+        "without_timestamps": True,
         "no_speech_threshold": 0.6,
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "initial_prompt": None,
+        "hotwords": None,
+        "language_detection_threshold": 0.75,
+        "language_detection_segments": 1,
     }
+
+
+def test_prepare_audio_does_not_boost_constant_signal_or_silence():
+    constant = np.full(16000, 300, dtype=np.int16)
+    prepared = _prepare_audio(
+        constant,
+        normalize=True,
+        target_rms=0.08,
+        max_gain=8.0,
+    )
+    silence = _prepare_audio(
+        np.zeros(16000, dtype=np.int16),
+        normalize=True,
+        target_rms=0.08,
+        max_gain=8.0,
+    )
+
+    assert prepared.dtype == np.float32
+    assert np.max(np.abs(prepared), initial=0.0) == 0.0
+    assert np.array_equal(silence, np.zeros(16000, dtype=np.float32))
+
+
+def test_prepare_audio_normalizes_non_constant_quiet_speech():
+    quiet = np.tile(np.array([120, -120], dtype=np.int16), 8000)
+
+    prepared = _prepare_audio(
+        quiet,
+        normalize=True,
+        target_rms=0.08,
+        max_gain=8.0,
+    )
+
+    assert prepared.dtype == np.float32
+    assert float(np.sqrt(np.mean(prepared.astype(np.float64) ** 2))) > 0.02
+
+
+def test_local_whisper_caches_detected_language_per_user():
+    model = FakeWhisperModel()
+    recognizer = LocalWhisperRecognizer(RecognitionConfig())
+    recognizer._model = model
+
+    asyncio.run(
+        recognizer.recognize(
+            np.tile(np.array([120, -120], dtype=np.int16), 8000),
+            16000,
+            "1",
+            "Alice",
+            language="auto",
+        )
+    )
+    asyncio.run(
+        recognizer.recognize(
+            np.tile(np.array([120, -120], dtype=np.int16), 8000),
+            16000,
+            "1",
+            "Alice",
+            language="auto",
+        )
+    )
+
+    assert model.calls[0]["language"] is None
+    assert model.calls[1]["language"] == "en"
 
 
 def test_google_numpy_to_wav_bytes_returns_headerless_pcm():

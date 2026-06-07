@@ -106,6 +106,7 @@ class SpeechRecognitionClient:
 
         self._recognizer = _build_recognizer(self._config)
         logger.info("Starting speech recognition — recognizer=%s", self._recognizer.name)
+        await self._recognizer.warmup()
 
         self._bot = VoiceRecognitionBot(
             config=self._config,

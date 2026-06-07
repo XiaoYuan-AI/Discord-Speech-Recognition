@@ -46,6 +46,10 @@ class FakeRecognizer:
         self.error = error
         self.calls = []
         self.closed = False
+        self.warmed = False
+
+    async def warmup(self):
+        self.warmed = True
 
     async def recognize(self, **kwargs):
         self.calls.append(kwargs)
@@ -137,6 +141,44 @@ def test_on_audio_segment_suppresses_empty_results_and_recognition_errors():
     asyncio.run(client._on_audio_segment(_segment()))
 
     assert received == []
+
+
+def test_start_warms_recognizer_before_connecting_bot(monkeypatch):
+    events = []
+    recognizer = FakeRecognizer()
+
+    async def warmup():
+        events.append("warmup")
+        recognizer.warmed = True
+
+    recognizer.warmup = warmup
+
+    def fake_build_recognizer(_config):
+        events.append("build")
+        return recognizer
+
+    class FakeBot:
+        def __init__(self, **_kwargs):
+            events.append("bot_init")
+
+        async def connect_and_listen(self):
+            events.append("connect")
+
+    monkeypatch.setattr(
+        "discord_speech_recognition.sdk._build_recognizer",
+        fake_build_recognizer,
+    )
+    monkeypatch.setattr(
+        "discord_speech_recognition.sdk.VoiceRecognitionBot",
+        FakeBot,
+    )
+
+    client = SpeechRecognitionClient(RecognitionConfig())
+
+    asyncio.run(client.start("token", 123))
+
+    assert recognizer.warmed is True
+    assert events == ["build", "warmup", "bot_init", "connect"]
 
 
 def test_stop_shuts_down_bot_and_recognizer():

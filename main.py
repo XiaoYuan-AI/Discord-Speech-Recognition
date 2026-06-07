@@ -121,6 +121,8 @@ async def main() -> None:
         language="auto",            # auto-detect language
         model_size="base",          # tiny / base / small / medium / large-v3
         device="cpu",               # or "cuda"
+        local_beam_size=3,          # balanced quality/speed for local Whisper
+        preload_local_model=True,   # avoid first-speech model load delay
         # VAD tuning (adjust if speech is missed or silence is too long):
         speech_threshold=0.015,
         silence_duration_ms=800,

@@ -45,6 +45,10 @@ class BaseRecognizer(abc.ABC):
         """Human-readable name of this recognizer backend."""
         ...
 
+    async def warmup(self) -> None:
+        """Prepare recognizer resources before the first audio segment."""
+        return None
+
     @abc.abstractmethod
     async def close(self) -> None:
         """Release any resources held by this recognizer."""

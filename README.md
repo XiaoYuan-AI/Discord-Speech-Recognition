@@ -100,6 +100,8 @@ config = RecognitionConfig(
     model_size="base",      # tiny | base | small | medium | large-v3
     device="cpu",            # or "cuda"
     compute_type="int8",     # int8 | float16 | float32
+    local_beam_size=3,       # 1 = fastest, 3 = balanced, 5+ = higher quality
+    preload_local_model=True, # avoid first-speech model load latency
     language="auto",         # "en", "zh", "ja", etc. -- or "auto"
 )
 ```
@@ -115,6 +117,10 @@ Model sizes and approximate VRAM:
 | large-v3 | ~10 GB    | slowest          |
 
 The model is downloaded automatically on first use from Hugging Face.
+By default the SDK preloads it during `client.start()` so the first speech
+segment transcribes faster.  For noisy or domain-specific channels, set
+`local_initial_prompt` and/or `local_hotwords` to bias Whisper toward expected
+names and vocabulary.
 
 ### Google Speech Recognition
 
@@ -209,6 +215,16 @@ All configuration options:
 | `model_size`            | `str`       | `"base"`          | Whisper model size (local only)       |
 | `device`                | `str`       | `"cpu"`           | `cpu` or `cuda` (local only)          |
 | `compute_type`          | `str`       | `"int8"`          | Compute precision (local only)        |
+| `preload_local_model`   | `bool`      | `True`            | Load local model during startup       |
+| `local_beam_size`       | `int`       | `3`               | Local Whisper quality/speed beam size |
+| `local_best_of`         | `int`       | `3`               | Local Whisper candidate count         |
+| `local_temperature`     | `float`     | `0.0`             | Local Whisper decode temperature      |
+| `local_cpu_threads`     | `int`       | `0`               | Local CPU thread count (`0` = auto)   |
+| `local_num_workers`     | `int`       | `1`               | Local faster-whisper worker count     |
+| `local_initial_prompt`  | `str\|None` | `None`            | Optional local Whisper prompt         |
+| `local_hotwords`        | `str\|None` | `None`            | Optional local Whisper hotwords       |
+| `cache_user_language`   | `bool`      | `True`            | Cache detected language per user      |
+| `language_confidence_threshold` | `float` | `0.75`        | Min confidence for language caching   |
 | `openai_api_key`        | `str\|None` | `None`            | OpenAI API key (whisper_api only)     |
 | `google_language`       | `str`       | `"en-US"`         | Language for Google recognizer        |
 | `speech_threshold`      | `float`     | `0.015`           | VAD speech energy threshold           |
@@ -217,6 +233,9 @@ All configuration options:
 | `max_speech_duration_ms`| `int`       | `15000`           | Max continuous speech before split    |
 | `silence_duration_ms`   | `int`       | `800`             | Silence before segment ends           |
 | `target_sample_rate`    | `int`       | `16000`           | Output sample rate (Hz)               |
+| `normalize_audio`       | `bool`      | `True`            | Normalize segments before local STT   |
+| `target_audio_rms`      | `float`     | `0.08`            | Target RMS for normalization          |
+| `max_audio_gain`        | `float`     | `8.0`             | Max normalization gain                |
 
 ## Architecture
 
